@@ -166,6 +166,13 @@ AC_ARG_ENABLE(
 )
 
 AC_ARG_ENABLE(
+	[openssl-ec],
+	[AS_HELP_STRING([--enable-openssl-ec],[enable openssl interface ec support])],
+	,
+	[enable_openssl_ec="no"]
+)
+
+AC_ARG_ENABLE(
 	[strict],
 	[AS_HELP_STRING([--enable-strict],[enable strict compiler warnings])],
 	,
@@ -469,6 +476,10 @@ fi
 if test "${enable_openssl}" = "yes"; then
 	AC_DEFINE([ENABLE_PKCS11H_OPENSSL], [1], [Enable openssl interface])
 	PKCS11H_FEATURES="${PKCS11H_FEATURES} openssl"
+fi
+if test "${enable_openssl_ec}" = "yes"; then
+	AC_DEFINE([ENABLE_PKCS11H_OPENSSL_EC], [1], [Enable openssl interface ec])
+	PKCS11H_FEATURES="${PKCS11H_FEATURES} openssl-ec"
 fi
 if test "${enable_crypto_engine_openssl}" = "yes"; then
 	crypto_engine=1
