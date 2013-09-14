@@ -73,11 +73,18 @@ struct pkcs11h_openssl_session_s {
 	int reference_count;
 	PKCS11H_BOOL initialized;
 	X509 *x509;
-	RSA_METHOD smart_rsa;
-	int (*rsa_orig_finish)(RSA *rsa);
 	pkcs11h_certificate_t certificate;
 	pkcs11h_hook_openssl_cleanup_t cleanup_hook;
 };
+
+static struct {
+#ifndef OPENSSL_NO_RSA
+	RSA_METHOD rsa;
+	int (*rsa_orig_finish)(RSA *rsa);
+#endif
+} __openssl_methods;
+
+#ifndef OPENSSL_NO_RSA
 
 static
 pkcs11h_openssl_session_t
@@ -316,8 +323,8 @@ __pkcs11h_openssl_rsa_finish (
 
 	RSA_set_ex_data (rsa, 0, NULL);
 
-	if (openssl_session->rsa_orig_finish != NULL) {
-		openssl_session->rsa_orig_finish (rsa);
+	if (__openssl_methods.rsa_orig_finish != NULL) {
+		__openssl_methods.rsa_orig_finish (rsa);
 
 #ifdef BROKEN_OPENSSL_ENGINE
 		{
@@ -344,6 +351,86 @@ __pkcs11h_openssl_rsa_finish (
 	);
 
 	return 1;
+}
+
+static
+PKCS11H_BOOL
+__pkcs11h_openssl_session_setRSA(
+	IN const pkcs11h_openssl_session_t openssl_session,
+	IN EVP_PKEY * evp
+) {
+	PKCS11H_BOOL ret = FALSE;
+	RSA *rsa = NULL;
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: __pkcs11h_openssl_session_setRSA - entered openssl_session=%p, evp=%p",
+		(void *)openssl_session,
+		(void *)evp
+	);
+
+	if (
+		(rsa = EVP_PKEY_get1_RSA (evp)) == NULL
+	) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot get RSA key");
+		goto cleanup;
+	}
+
+	RSA_set_method (rsa, &__openssl_methods.rsa);
+	RSA_set_ex_data (rsa, 0, openssl_session);
+
+	rsa->flags |= RSA_FLAG_SIGN_VER;
+
+#ifdef BROKEN_OPENSSL_ENGINE
+	if (!rsa->engine) {
+		rsa->engine = ENGINE_get_default_RSA ();
+	}
+
+	ENGINE_set_RSA(ENGINE_get_default_RSA (), &openssl_session->rsa);
+	_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: OpenSSL engine support is broken! Workaround enabled");
+#endif
+
+	ret = TRUE;
+
+cleanup:
+
+	if (rsa != NULL) {
+		RSA_free (rsa);
+		rsa = NULL;
+	}
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: __pkcs11h_openssl_session_setRSA - return ret=%d",
+		ret
+	);
+
+	return ret;
+}
+
+#endif
+
+PKCS11H_BOOL
+_pkcs11h_openssl_initialize (void) {
+#ifndef OPENSSL_NO_RSA
+{
+	const RSA_METHOD *defrsa;
+	defrsa = RSA_get_default_method ();
+	memmove (&__openssl_methods.rsa, defrsa, sizeof(RSA_METHOD));
+	__openssl_methods.rsa_orig_finish = defrsa->finish;
+	__openssl_methods.rsa.name = "pkcs11";
+	__openssl_methods.rsa.rsa_priv_dec = __pkcs11h_openssl_rsa_dec;
+	__openssl_methods.rsa.rsa_priv_enc = __pkcs11h_openssl_rsa_enc;
+	__openssl_methods.rsa.finish = __pkcs11h_openssl_rsa_finish;
+	__openssl_methods.rsa.flags  = RSA_METHOD_FLAG_NO_CHECK | RSA_FLAG_EXT_PKEY;
+}
+#endif
+	return TRUE;
+}
+
+PKCS11H_BOOL
+_pkcs11h_openssl_terminate (void) {
+	return TRUE;
 }
 
 X509 *
@@ -427,7 +514,6 @@ pkcs11h_openssl_session_t
 pkcs11h_openssl_createSession (
 	IN const pkcs11h_certificate_t certificate
 ) {
-	const RSA_METHOD *def;
 	pkcs11h_openssl_session_t openssl_session = NULL;
 	PKCS11H_BOOL ok = FALSE;
 
@@ -448,17 +534,6 @@ pkcs11h_openssl_createSession (
 		goto cleanup;
 	}
 
-	def = RSA_get_default_method ();
-
-	memmove (&openssl_session->smart_rsa, def, sizeof(RSA_METHOD));
-
-	openssl_session->rsa_orig_finish = def->finish;
-
-	openssl_session->smart_rsa.name = "pkcs11";
-	openssl_session->smart_rsa.rsa_priv_dec = __pkcs11h_openssl_rsa_dec;
-	openssl_session->smart_rsa.rsa_priv_enc = __pkcs11h_openssl_rsa_enc;
-	openssl_session->smart_rsa.finish = __pkcs11h_openssl_rsa_finish;
-	openssl_session->smart_rsa.flags  = RSA_METHOD_FLAG_NO_CHECK | RSA_FLAG_EXT_PKEY;
 	openssl_session->certificate = certificate;
 	openssl_session->reference_count = 1;
 
@@ -541,10 +616,71 @@ RSA *
 pkcs11h_openssl_session_getRSA (
 	IN const pkcs11h_openssl_session_t openssl_session
 ) {
-	X509 *x509 = NULL;
+#ifndef OPENSSL_NO_RSA
 	RSA *rsa = NULL;
-	EVP_PKEY *pubkey = NULL;
-	PKCS11H_BOOL ok = FALSE;
+	RSA *ret = NULL;
+	EVP_PKEY *evp = NULL;
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: pkcs11h_openssl_session_getRSA - entry openssl_session=%p",
+		(void *)openssl_session
+	);
+
+	if ((evp = pkcs11h_openssl_session_getEVP(openssl_session)) == NULL) {
+		goto cleanup;
+	}
+
+	if (evp->type != EVP_PKEY_RSA) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Invalid public key algorithm");
+		goto cleanup;
+	}
+
+	if (
+		(rsa = EVP_PKEY_get1_RSA (evp)) == NULL
+	) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot get RSA key");
+		goto cleanup;
+	}
+
+	ret = rsa;
+	rsa = NULL;
+
+cleanup:
+
+	/*
+	 * openssl objects have reference
+	 * count, so release them
+	 */
+	if (rsa != NULL) {
+		RSA_free (rsa);
+		rsa = NULL;
+	}
+
+	if (evp != NULL) {
+		EVP_PKEY_free (evp);
+		evp = NULL;
+	}
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: pkcs11h_openssl_session_getRSA - return ret=%p",
+		(void *)rsa
+	);
+
+	return ret;
+#else
+	return NULL;
+#endif
+}
+
+EVP_PKEY *
+pkcs11h_openssl_session_getEVP (
+	IN const pkcs11h_openssl_session_t openssl_session
+) {
+	X509 *x509 = NULL;
+	EVP_PKEY *evp = NULL;
+	EVP_PKEY *ret = NULL;
 
 	_PKCS11H_ASSERT (openssl_session!=NULL);
 	_PKCS11H_ASSERT (!openssl_session->initialized);
@@ -552,7 +688,7 @@ pkcs11h_openssl_session_getRSA (
 
 	_PKCS11H_DEBUG (
 		PKCS11H_LOG_DEBUG2,
-		"PKCS#11: pkcs11h_openssl_session_getRSA - entry openssl_session=%p",
+		"PKCS#11: pkcs11h_openssl_session_getEVP - entry openssl_session=%p",
 		(void *)openssl_session
 	);
 
@@ -564,57 +700,40 @@ pkcs11h_openssl_session_getRSA (
 		goto cleanup;
 	}
 
-	if ((pubkey = X509_get_pubkey (x509)) == NULL) {
+	if ((evp = X509_get_pubkey (x509)) == NULL) {
 		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot get public key");
 		goto cleanup;
 	}
 
-	if (pubkey->type != EVP_PKEY_RSA) {
-		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Invalid public key algorithm");
-		goto cleanup;
+	if (0) {
 	}
-
-	if (
-		(rsa = EVP_PKEY_get1_RSA (pubkey)) == NULL
-	) {
-		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot get RSA key");
-		goto cleanup;
-	}
-
-	RSA_set_method (rsa, &openssl_session->smart_rsa);
-	RSA_set_ex_data (rsa, 0, openssl_session);
-	openssl_session->reference_count++;
-
-#ifdef BROKEN_OPENSSL_ENGINE
-	if (!rsa->engine) {
-		rsa->engine = ENGINE_get_default_RSA ();
-	}
-
-	ENGINE_set_RSA(ENGINE_get_default_RSA (), &openssl_session->smart_rsa);
-	_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: OpenSSL engine support is broken! Workaround enabled");
-#endif
-
-	rsa->flags |= RSA_FLAG_SIGN_VER;
-	openssl_session->initialized = TRUE;
-
-	ok = TRUE;
-
-cleanup:
-
-	if (!ok) {
-		if (rsa != NULL) {
-			RSA_free (rsa);
-			rsa = NULL;
+#ifndef OPENSSL_NO_RSA
+	else if (evp->type == EVP_PKEY_RSA) {
+		if (!__pkcs11h_openssl_session_setRSA(openssl_session, evp)) {
+			goto cleanup;
 		}
 	}
+#endif
+	else {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Invalid public key algorithm %d", evp->type);
+		goto cleanup;
+	}
+
+	openssl_session->reference_count++;
+	openssl_session->initialized = TRUE;
+
+	ret = evp;
+	evp = NULL;
+
+cleanup:
 
 	/*
 	 * openssl objects have reference
 	 * count, so release them
 	 */
-	if (pubkey != NULL) {
-		EVP_PKEY_free (pubkey);
-		pubkey = NULL;
+	if (evp != NULL) {
+		EVP_PKEY_free (evp);
+		evp = NULL;
 	}
 
 	if (x509 != NULL) {
@@ -624,11 +743,11 @@ cleanup:
 
 	_PKCS11H_DEBUG (
 		PKCS11H_LOG_DEBUG2,
-		"PKCS#11: pkcs11h_openssl_session_getRSA - return rsa=%p",
-		(void *)rsa
+		"PKCS#11: pkcs11h_openssl_session_getEVP - return ret=%p",
+		(void *)ret
 	);
 
-	return rsa;
+	return ret;
 }
 
 X509 *
