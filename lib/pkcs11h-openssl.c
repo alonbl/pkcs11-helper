@@ -82,6 +82,10 @@ static struct {
 	RSA_METHOD rsa;
 	int (*rsa_orig_finish)(RSA *rsa);
 #endif
+#ifndef OPENSSL_NO_DSA
+	DSA_METHOD dsa;
+	int (*dsa_orig_finish)(DSA *dsa);
+#endif
 } __openssl_methods;
 
 #ifndef OPENSSL_NO_RSA
@@ -410,6 +414,207 @@ cleanup:
 
 #endif
 
+#ifndef OPENSSL_NO_DSA
+
+static
+pkcs11h_openssl_session_t
+__pkcs11h_openssl_dsa_get_openssl_session (
+	IN OUT const DSA *dsa
+) {
+	pkcs11h_openssl_session_t session;
+
+	_PKCS11H_ASSERT (dsa!=NULL);
+	session = (pkcs11h_openssl_session_t)DSA_get_ex_data ((DSA *)dsa, 0);
+	_PKCS11H_ASSERT (session!=NULL);
+
+	return session;
+}
+
+static
+pkcs11h_certificate_t
+__pkcs11h_openssl_dsa_get_pkcs11h_certificate (
+	IN OUT const DSA *dsa
+) {
+	pkcs11h_openssl_session_t session = __pkcs11h_openssl_dsa_get_openssl_session (dsa);
+
+	_PKCS11H_ASSERT (session!=NULL);
+	_PKCS11H_ASSERT (session->certificate!=NULL);
+
+	return session->certificate;
+}
+
+static
+DSA_SIG *
+__pkcs11h_openssl_dsa_do_sign(
+	IN const unsigned char *dgst,
+	IN int dlen,
+	OUT DSA *dsa
+) {
+	pkcs11h_certificate_t certificate = __pkcs11h_openssl_dsa_get_pkcs11h_certificate (dsa);
+	unsigned char *sigbuf = NULL;
+	size_t siglen;
+	DSA_SIG *sig = NULL;
+	DSA_SIG *ret = NULL;
+	CK_RV rv = CKR_FUNCTION_FAILED;
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: __pkcs11h_openssl_dsa_do_sign - entered dgst=%p, dlen=%d, dsa=%p",
+		(void *)dgst,
+		dlen,
+		(void *)dsa
+	);
+
+	_PKCS11H_ASSERT (dgst!=NULL);
+	_PKCS11H_ASSERT (dsa!=NULL);
+	_PKCS11H_ASSERT (certificate!=NULL);
+
+	if (
+		(rv = pkcs11h_certificate_signAny (
+			certificate,
+			CKM_DSA,
+			dgst,
+			(size_t)dlen,
+			NULL,
+			&siglen
+		)) != CKR_OK
+	) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot perform signature %ld:'%s'", rv, pkcs11h_getMessage (rv));
+		goto cleanup;
+	}
+
+	if ((rv = _pkcs11h_mem_malloc ((void *)&sigbuf, siglen)) != CKR_OK) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot cannot allocate signature buffer");
+		goto cleanup;
+	}
+
+	if (
+		(rv = pkcs11h_certificate_signAny (
+			certificate,
+			CKM_DSA,
+			dgst,
+			(size_t)dlen,
+			sigbuf,
+			&siglen
+		)) != CKR_OK
+	) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot perform signature %ld:'%s'", rv, pkcs11h_getMessage (rv));
+		goto cleanup;
+	}
+
+	if ((sig = DSA_SIG_new ()) == NULL) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot allocate DSA_SIG");
+		goto cleanup;
+	}
+
+	if (BN_bin2bn (&sigbuf[0], siglen/2, sig->r) == NULL) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot convert dsa r");
+		goto cleanup;
+	}
+
+	if (BN_bin2bn (&sigbuf[siglen/2], siglen/2, sig->s) == NULL) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot convert dsa s");
+		goto cleanup;
+	}
+
+	ret = sig;
+	sig = NULL;
+
+cleanup:
+
+	if (sigbuf != NULL) {
+		_pkcs11h_mem_free ((void *)&sigbuf);
+	}
+
+	if (sig != NULL) {
+		DSA_SIG_free (sig);
+		sig = NULL;
+	}
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: __pkcs11h_openssl_dsa_do_sign - return sig=%p",
+		(void *)sig
+	);
+
+	return ret;
+}
+
+static
+int
+__pkcs11h_openssl_dsa_finish (
+	IN OUT DSA *dsa
+) {
+	pkcs11h_openssl_session_t openssl_session = __pkcs11h_openssl_dsa_get_openssl_session (dsa);
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: __pkcs11h_openssl_dsa_finish - entered dsa=%p",
+		(void *)dsa
+	);
+
+	DSA_set_ex_data (dsa, 0, NULL);
+
+	if (__openssl_methods.dsa_orig_finish != NULL) {
+		__openssl_methods.dsa_orig_finish (dsa);
+	}
+
+	pkcs11h_openssl_freeSession (openssl_session);
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: __pkcs11h_openssl_dsa_finish - return"
+	);
+
+	return 1;
+}
+
+static
+PKCS11H_BOOL
+__pkcs11h_openssl_session_setDSA(
+	IN const pkcs11h_openssl_session_t openssl_session,
+	IN EVP_PKEY * evp
+) {
+	PKCS11H_BOOL ret = FALSE;
+	DSA *dsa = NULL;
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: __pkcs11h_openssl_session_setDSA - entered openssl_session=%p, evp=%p",
+		(void *)openssl_session,
+		(void *)evp
+	);
+
+	if (
+		(dsa = EVP_PKEY_get1_DSA (evp)) == NULL
+	) {
+		_PKCS11H_LOG (PKCS11H_LOG_WARN, "PKCS#11: Cannot get DSA key");
+		goto cleanup;
+	}
+
+	DSA_set_method (dsa, &__openssl_methods.dsa);
+	DSA_set_ex_data (dsa, 0, openssl_session);
+
+	ret = TRUE;
+
+cleanup:
+
+	if (dsa != NULL) {
+		DSA_free (dsa);
+		dsa = NULL;
+	}
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: __pkcs11h_openssl_session_setDSA - return ret=%d",
+		ret
+	);
+
+	return ret;
+}
+
+#endif
+
 PKCS11H_BOOL
 _pkcs11h_openssl_initialize (void) {
 #ifndef OPENSSL_NO_RSA
@@ -423,6 +628,17 @@ _pkcs11h_openssl_initialize (void) {
 	__openssl_methods.rsa.rsa_priv_enc = __pkcs11h_openssl_rsa_enc;
 	__openssl_methods.rsa.finish = __pkcs11h_openssl_rsa_finish;
 	__openssl_methods.rsa.flags  = RSA_METHOD_FLAG_NO_CHECK | RSA_FLAG_EXT_PKEY;
+}
+#endif
+#ifndef OPENSSL_NO_DSA
+{
+	const DSA_METHOD *defdsa;
+	defdsa = DSA_get_default_method ();
+	memmove (&__openssl_methods.dsa, defdsa, sizeof(DSA_METHOD));
+	__openssl_methods.dsa_orig_finish = defdsa->finish;
+	__openssl_methods.dsa.name = "pkcs11";
+	__openssl_methods.dsa.dsa_do_sign = __pkcs11h_openssl_dsa_do_sign;
+	__openssl_methods.dsa.finish = __pkcs11h_openssl_dsa_finish;
 }
 #endif
 	return TRUE;
@@ -710,6 +926,13 @@ pkcs11h_openssl_session_getEVP (
 #ifndef OPENSSL_NO_RSA
 	else if (evp->type == EVP_PKEY_RSA) {
 		if (!__pkcs11h_openssl_session_setRSA(openssl_session, evp)) {
+			goto cleanup;
+		}
+	}
+#endif
+#ifndef OPENSSL_NO_RSA
+	else if (evp->type == EVP_PKEY_DSA) {
+		if (!__pkcs11h_openssl_session_setDSA(openssl_session, evp)) {
 			goto cleanup;
 		}
 	}
