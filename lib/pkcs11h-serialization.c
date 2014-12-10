@@ -150,8 +150,155 @@ cleanup:
 	return rv;
 }
 
-CK_RV
-pkcs11h_token_deserializeTokenId (
+static int hexnybble(char c)
+{
+	if (c >= '0' || c <= '9')
+		return c - '0';
+	else if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	else if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	else return -1;
+}
+
+static CK_RV parse_token_uri_attr (
+	const char *uri,
+	size_t urilen,
+	char *tokstr,
+	size_t toklen,
+	size_t *parsed_len
+) {
+	int n1, n2;
+	size_t orig_toklen = toklen;
+
+	while (urilen && toklen > 1) {
+		if (*uri == '%') {
+			if (urilen < 3)
+				return CKR_ATTRIBUTE_VALUE_INVALID;
+
+			n1 = hexnybble(uri[1]);
+			n2 = hexnybble(uri[2]);
+			if (n1 == -1 || n2 == -1)
+				return CKR_ATTRIBUTE_VALUE_INVALID;
+
+			*tokstr = (n1 << 4) | n2;
+			uri += 2;
+			urilen -= 2;
+		} else {
+			*tokstr = *uri;
+		}
+		tokstr++;
+		uri++;
+		toklen--;
+		urilen--;
+		tokstr[1] = 0;
+	}
+	if (urilen)
+		return CKR_ATTRIBUTE_VALUE_INVALID;
+
+	if (parsed_len)
+		*parsed_len = orig_toklen - toklen;
+
+	return CKR_OK;
+}
+
+static CK_RV parse_id_attr (
+	const char *uri,
+	size_t urilen,
+	CK_BYTE_PTR *p_id,
+	size_t *p_id_len
+) {
+	CK_RV rv;
+
+	rv = _pkcs11h_mem_malloc ((void *)p_id, urilen + 1);
+	if (rv != CKR_OK)
+		return rv;
+
+	return parse_token_uri_attr (uri, urilen, (void *)*p_id, urilen + 1, p_id_len);
+}
+
+static CK_RV parse_pkcs11_uri (
+	OUT pkcs11h_token_id_t token_id,
+	OUT pkcs11h_certificate_id_t certificate_id,
+	IN const char * const sz
+) {
+	const char *semicolon, *equals, *p;
+
+	_PKCS11H_ASSERT (token_id!=NULL);
+	_PKCS11H_ASSERT (sz!=NULL);
+
+	if (strncmp (sz, "pkcs11:", 7))
+		return CKR_ATTRIBUTE_VALUE_INVALID;
+
+	semicolon = sz + 6;
+	while (semicolon[0] && semicolon[1]) {
+		int keylen;
+
+		p = semicolon + 1;
+		semicolon = strchr (p, ';');
+		if (!semicolon)
+			semicolon = p + strlen(p);
+
+		equals = strchr (p, '=');
+		if (equals > semicolon)
+			return CKR_ATTRIBUTE_VALUE_INVALID;
+
+		keylen = equals - p;
+
+		if (keylen == 5 && !strncmp(p, "model", 5) &&
+		    parse_token_uri_attr(equals + 1, semicolon - equals - 1,
+					 (char *)&token_id->model,
+					 sizeof(token_id->model),
+					 NULL) == CKR_OK)
+			continue;
+		else if (keylen == 5 && !strncmp(p, "token", 5) &&
+			 parse_token_uri_attr(equals + 1, semicolon - equals - 1,
+					      (char *)&token_id->label,
+					      sizeof(token_id->label),
+					      NULL) == CKR_OK)
+			continue;
+		else if (keylen == 12 && !strncmp(p, "manufacturer", 12) &&
+			 parse_token_uri_attr(equals + 1, semicolon - equals - 1,
+					      (char *)&token_id->manufacturerID,
+					      sizeof(token_id->manufacturerID),
+					      NULL) == CKR_OK)
+			continue;
+		else if (keylen == 6 && !strncmp(p, "serial", 6) &&
+			 parse_token_uri_attr(equals + 1, semicolon - equals - 1,
+					      (char *)&token_id->serialNumber,
+					      sizeof(token_id->serialNumber),
+					      NULL) == CKR_OK)
+			continue;
+		else if (certificate_id && keylen == 2 && !strncmp(p, "id", 2) &&
+			 parse_id_attr(equals + 1, semicolon - equals - 1,
+				       &certificate_id->attrCKA_ID,
+				       &certificate_id->attrCKA_ID_size) == CKR_OK)
+			continue;
+		/* We don't parse object= because the match code doesn't support
+		   matching by label. */
+
+		/* Failed to parse PKCS#11 URI element. */
+		return CKR_ATTRIBUTE_VALUE_INVALID;
+	}
+	/* The matching code doesn't support support partial matches; it needs
+	 * *all* of manufacturer, model, serial and label attributes to be
+	 * defined. So reject partial URIs early instead of letting it do the
+	 * wrong thing. We can maybe improve this later. */
+	if (!token_id->model[0] || !token_id->label[0] ||
+	    !token_id->manufacturerID[0] || !token_id->serialNumber[0]) {
+		return CKR_ATTRIBUTE_VALUE_INVALID;
+	}
+
+	/* For a certificate ID we need CKA_ID */
+	if (certificate_id && !certificate_id->attrCKA_ID_size) {
+		return CKR_ATTRIBUTE_VALUE_INVALID;
+	}
+
+	return CKR_OK;
+}
+
+static CK_RV
+pkcs11h_token_legacy_deserializeTokenId (
 	OUT pkcs11h_token_id_t *p_token_id,
 	IN const char * const sz
 ) {
@@ -166,18 +313,6 @@ pkcs11h_token_deserializeTokenId (
 	char *_sz = NULL;
 	int e;
 	CK_RV rv = CKR_FUNCTION_FAILED;
-
-	_PKCS11H_ASSERT (p_token_id!=NULL);
-	_PKCS11H_ASSERT (sz!=NULL);
-
-	_PKCS11H_DEBUG (
-		PKCS11H_LOG_DEBUG2,
-		"PKCS#11: pkcs11h_token_deserializeTokenId entry p_token_id=%p, sz='%s'",
-		(void *)p_token_id,
-		sz
-	);
-
-	*p_token_id = NULL;
 
 	if (
 		(rv = _pkcs11h_mem_strdup (
@@ -284,6 +419,70 @@ cleanup:
 #undef __PKCS11H_TARGETS_NUMBER
 }
 
+CK_RV
+pkcs11h_token_deserializeTokenId (
+	OUT pkcs11h_token_id_t *p_token_id,
+	IN const char * const sz
+) {
+#define __PKCS11H_TARGETS_NUMBER 4
+	struct {
+		char *p;
+		size_t s;
+	} targets[__PKCS11H_TARGETS_NUMBER];
+
+	pkcs11h_token_id_t token_id = NULL;
+	CK_RV rv = CKR_FUNCTION_FAILED;
+
+	_PKCS11H_ASSERT (p_token_id!=NULL);
+	_PKCS11H_ASSERT (sz!=NULL);
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: pkcs11h_token_deserializeTokenId entry p_token_id=%p, sz='%s'",
+		(void *)p_token_id,
+		sz
+	);
+
+	*p_token_id = NULL;
+
+	if (strncmp (sz, "pkcs11:", 7))
+		return pkcs11h_token_legacy_deserializeTokenId(p_token_id, sz);
+
+	if ((rv = _pkcs11h_token_newTokenId (&token_id)) != CKR_OK) {
+		goto cleanup;
+	}
+
+	if ((rv = parse_pkcs11_uri(token_id, NULL, sz)) != CKR_OK) {
+		goto cleanup;
+	}
+
+	strncpy (
+		token_id->display,
+		token_id->label,
+		sizeof (token_id->display)
+	);
+
+	*p_token_id = token_id;
+	token_id = NULL;
+
+	rv = CKR_OK;
+
+cleanup:
+	if (token_id != NULL) {
+		pkcs11h_token_freeTokenId (token_id);
+	}
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: pkcs11h_token_deserializeTokenId return rv=%lu-'%s'",
+		rv,
+		pkcs11h_getMessage (rv)
+	);
+
+	return rv;
+#undef __PKCS11H_TARGETS_NUMBER
+}
+
 #endif				/* ENABLE_PKCS11H_TOKEN || ENABLE_PKCS11H_CERTIFICATE */
 
 #if defined(ENABLE_PKCS11H_CERTIFICATE)
@@ -360,8 +559,8 @@ cleanup:
 	return rv;
 }
 
-CK_RV
-pkcs11h_certificate_deserializeCertificateId (
+static CK_RV
+pkcs11h_certificate_legacy_deserializeCertificateId (
 	OUT pkcs11h_certificate_id_t * const p_certificate_id,
 	IN const char * const sz
 ) {
@@ -369,18 +568,6 @@ pkcs11h_certificate_deserializeCertificateId (
 	CK_RV rv = CKR_FUNCTION_FAILED;
 	char *p = NULL;
 	char *_sz = NULL;
-
-	_PKCS11H_ASSERT (p_certificate_id!=NULL);
-	_PKCS11H_ASSERT (sz!=NULL);
-
-	*p_certificate_id = NULL;
-
-	_PKCS11H_DEBUG (
-		PKCS11H_LOG_DEBUG2,
-		"PKCS#11: pkcs11h_certificate_deserializeCertificateId entry p_certificate_id=%p, sz='%s'",
-		(void *)p_certificate_id,
-		sz
-	);
 
 	if (
 		(rv = _pkcs11h_mem_strdup (
@@ -443,6 +630,61 @@ cleanup:
 
 	if (_sz != NULL) {
 		_pkcs11h_mem_free ((void *)&_sz);
+	}
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: pkcs11h_certificate_legacy_deserializeCertificateId return rv=%lu-'%s'",
+		rv,
+		pkcs11h_getMessage (rv)
+	);
+
+	return rv;
+
+}
+
+CK_RV
+pkcs11h_certificate_deserializeCertificateId (
+	OUT pkcs11h_certificate_id_t * const p_certificate_id,
+	IN const char * const sz
+) {
+	pkcs11h_certificate_id_t certificate_id = NULL;
+	CK_RV rv = CKR_FUNCTION_FAILED;
+
+	_PKCS11H_ASSERT (p_certificate_id!=NULL);
+	_PKCS11H_ASSERT (sz!=NULL);
+
+	*p_certificate_id = NULL;
+
+	_PKCS11H_DEBUG (
+		PKCS11H_LOG_DEBUG2,
+		"PKCS#11: pkcs11h_certificate_deserializeCertificateId entry p_certificate_id=%p, sz='%s'",
+		(void *)p_certificate_id,
+		sz
+	);
+
+	if (strncmp(sz, "pkcs11:", 7))
+		return pkcs11h_certificate_legacy_deserializeCertificateId (p_certificate_id, sz);
+
+	if ((rv = _pkcs11h_certificate_newCertificateId (&certificate_id)) != CKR_OK) {
+		goto cleanup;
+	}
+	if ((rv = _pkcs11h_token_newTokenId (&certificate_id->token_id)) != CKR_OK) {
+		goto cleanup;
+	}
+
+	if ((rv= parse_pkcs11_uri(certificate_id->token_id, certificate_id, sz)) != CKR_OK) {
+		goto cleanup;
+	}
+
+	*p_certificate_id = certificate_id;
+	certificate_id = NULL;
+	rv = CKR_OK;
+
+cleanup:
+	if (certificate_id != NULL) {
+		pkcs11h_certificate_freeCertificateId (certificate_id);
+		certificate_id = NULL;
 	}
 
 	_PKCS11H_DEBUG (
